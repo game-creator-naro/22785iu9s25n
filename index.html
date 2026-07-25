@@ -330,25 +330,21 @@
   }
   .segbtn.active { background:linear-gradient(180deg,#ffb85c,#ff9426); color:#fff; box-shadow:0 2px 0 #d97606; }
 
-  /* たしざん・ひきざん 式エリア */
-  #eqs {
-    display:flex; flex-direction:column; gap:8px;
-    background:#ffffffb0; padding:12px 16px; border-radius:18px;
-    box-shadow:0 2px 8px rgba(180,140,80,.22);
+  /* 個数表示 */
+  #counts { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+  .chip {
+    display:flex; align-items:center; gap:8px;
+    background:#ffffffd0; border-radius:999px; padding:8px 16px;
+    box-shadow:0 2px 6px rgba(180,140,80,.22);
+    font-weight:bold; font-size:clamp(15px,4.2vw,19px);
   }
-  .eqline { display:flex; align-items:center; gap:8px; font-size:clamp(17px,4.8vw,25px); font-weight:bold; }
-  .tag {
-    font-size:clamp(11px,3vw,14px); font-weight:bold;
-    background:#efe3c8; color:#8a7a5f;
-    padding:4px 10px; border-radius:999px; letter-spacing:1px;
-    min-width:4.2em; text-align:center;
-  }
-  .tag.sub { background:#dbe9f7; color:#4a6f9b; }
-  .pill { min-width:1.9em; text-align:center; padding:2px 12px; border-radius:999px; color:#fff; box-shadow:0 2px 0 rgba(0,0,0,.15); }
-  .blue-pill   { background:#2f9bff; }
-  .orange-pill { background:#ff9426; }
-  .total-pill  { background:#8a7a5f; }
-  .op { color:#b39a74; }
+  .chip .dot { width:16px; height:16px; border-radius:50%; box-shadow:inset 0 -2px 3px rgba(0,0,0,.15); }
+  .blue-chip .dot { background:#2f9bff; }
+  .orange-chip .dot { background:#ff9426; }
+  .chip .n { min-width:1.5em; text-align:center; font-size:clamp(22px,6vw,28px); }
+  .blue-chip .n { color:#1e90f0; }
+  .orange-chip .n { color:#ff8c1a; }
+
   .bump { animation:bump .2s ease; }
   @keyframes bump { 0%{transform:scale(1)} 50%{transform:scale(1.25)} 100%{transform:scale(1)} }
 
@@ -405,23 +401,9 @@
     <button class="segbtn" data-n="30">30</button>
   </div>
 
-  <div id="eqs">
-    <div class="eqline">
-      <span class="tag">たしざん</span>
-      <span class="pill blue-pill" id="addA">0</span>
-      <span class="op">＋</span>
-      <span class="pill orange-pill" id="addB">10</span>
-      <span class="op">＝</span>
-      <span class="pill total-pill" id="addC">10</span>
-    </div>
-    <div class="eqline">
-      <span class="tag sub">ひきざん</span>
-      <span class="pill total-pill" id="subA">10</span>
-      <span class="op">−</span>
-      <span class="pill blue-pill" id="subB">0</span>
-      <span class="op">＝</span>
-      <span class="pill orange-pill" id="subC">10</span>
-    </div>
+  <div id="counts">
+    <div class="chip blue-chip"><span class="dot"></span>あお <span class="n" id="blueNum">0</span> こ</div>
+    <div class="chip orange-chip"><span class="dot"></span>オレンジ <span class="n" id="orangeNum">10</span> こ</div>
   </div>
 
   <div id="board"></div>
@@ -437,16 +419,12 @@
   var total = 10;
   var blocks = []; // true = 青, false = オレンジ
 
-  var board    = document.getElementById('board');
-  var numsEl   = document.getElementById('nums');
-  var addA     = document.getElementById('addA');
-  var addB     = document.getElementById('addB');
-  var addC     = document.getElementById('addC');
-  var subA     = document.getElementById('subA');
-  var subB     = document.getElementById('subB');
-  var subC     = document.getElementById('subC');
-  var resetBtn = document.getElementById('reset');
-  var segBtns  = document.querySelectorAll('.segbtn');
+  var board     = document.getElementById('board');
+  var numsEl    = document.getElementById('nums');
+  var blueNum   = document.getElementById('blueNum');
+  var orangeNum = document.getElementById('orangeNum');
+  var resetBtn  = document.getElementById('reset');
+  var segBtns   = document.querySelectorAll('.segbtn');
 
   /* ---------- 音（最初のタップで解禁） ---------- */
   var actx = null;
@@ -477,21 +455,15 @@
   function bumpEl(el) {
     el.classList.remove('bump'); void el.offsetWidth; el.classList.add('bump');
   }
-  function setPill(el, v) {
+  function setNum(el, v) {
     var s = String(v);
     if (el.textContent !== s) { el.textContent = s; bumpEl(el); }
   }
-  function updateEq() {
+  function updateCounts() {
     var b = 0, i;
     for (i = 0; i < blocks.length; i++) { if (blocks[i]) b++; }
-    // たしざん: あお ＋ オレンジ ＝ ぜんぶ
-    setPill(addA, b);
-    setPill(addB, total - b);
-    setPill(addC, total);
-    // ひきざん: ぜんぶ − あお ＝ オレンジ
-    setPill(subA, total);
-    setPill(subB, b);
-    setPill(subC, total - b);
+    setNum(blueNum, b);
+    setNum(orangeNum, total - b);
   }
 
   function popEl(el) {
@@ -504,7 +476,7 @@
     el.classList.toggle('blue', blocks[i]);
     popEl(el);
     blip(blocks[i] ? 660 : 392);
-    updateEq();
+    updateCounts();
   }
 
   function buildBoard() {
@@ -520,7 +492,7 @@
         setTimeout(function () { popEl(d); }, i * 18); // 出現アニメ
       })(i);
     }
-    updateEq();
+    updateCounts();
   }
 
   /* 左詰めで n 個を青にする（1〜10ボタン / リセット） */
@@ -537,7 +509,7 @@
             popEl(el);
             blip(420 + i * 22);
           }
-          updateEq();
+          updateCounts();
         }, i * 28);
       })(i);
     }
