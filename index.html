@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="ja">
+<head><script>var __GCN_ASSETS__ = {"images":{},"sfx":{},"music":{},"videos":{},"models":{}};
+// bridge: 自由記述 HTML モード（rtfree-1）向けの依存ゼロ IIFE ブリッジ（D-043・docs/freeform-design.md）。
+// K3 が書いた完全な HTML 文書に、合成時（apps/platform/src/gen/compose.ts の composeFreeform）が
+// <head> 直後へ <script> として 1 本インライン注入する。
+//
+// postMessage プロトコルは games/runtime/gamekit.js と**同一のメッセージ種別・ペイロード形式**を使う。
+// これにより Play.tsx / apps/platform/src/verify/gate-a.ts の受け側は変更不要になる
+// （親 → iframe: {kind:"gamekit-init", versionId, saveData}+port2 / iframe → 親: gamekit-ready
+//   / gamekit-error / gamekit-score / gamekit-save）。
+//
+// 公開 API（apps/platform/src/ai/prompts.ts の buildFreeformReference と同期させること）:
+//   GCN.saveData  … 復元用セーブデータ。init 受信までは null、受信後は渡されたオブジェクト
+//   GCN.assets    … 生成素材マニフェスト（images/sfx/music/videos/models。値は URL 文字列）。
+//     __GCN_ASSETS__ グローバル（compose.ts が注入）があればそれを使い、無ければ空マニフェスト
+//   GCN.score(n)   … スコア（数値）を親ページへ送信する
+//   GCN.save(str)  … セーブデータ（JSON 文字列。呼び出し側で JSON.stringify 済みのもの）を送信する
+//   GCN.onInit     … 任意のユーザー定義コールバック（function (saveData) {...}）。
+//     init 受信時に saveData を渡して呼ばれる（生成ロジック側が代入する。未定義なら何もしない）
+//
+// このファイルのソースには script 閉じタグの文字列（山括弧 + スラッシュ + script）を
+// 含めないこと（compose.ts が script 要素として生のまま埋め込むため。含めると HTML パーサが
+//  そこでスクリプトを終端してしまう）。
+(function (global) {
+  "use strict";
+
+  var MAX_REPORTED_ERRORS = 20; // 診断チャネルへの連投防止（同一フレームで例外が続くケース対策）
+  var MAX_PENDING_ERRORS = MAX_REPORTED_ERRORS;
+
+  var diagPort = null;
+  var diagVersionId = null;
+  var reportedErrorCount = 0;
+  var pendingErrors = []; // port 確立前に発生したエラーを溜めておき、確立後にまとめて送る
+  var readyFlag = false; // load + rAF 2 フレーム経過（ready 自動送信の条件）
+  var readySent = false;
+
+  function emptyAssetsManifest() {
+    return { images: {}, sfx: {}, music: {}, videos: {}, models: {} };
+  }
+
+  // compose.ts が bridge スクリプトの直前に `var __GCN_ASSETS__ = {...};` を注入する
+  // （games/runtime/gamekit.js の __GAMEKIT_ASSETS__ と同じ取り込み方式）。
+  // 取り込んだらグローバルからは即座に消す（生成ロジックに生の変数を触らせない）
+  var assetsManifest = (function () {
+    var manifest = global.__GCN_ASSETS__;
+    try {
+      delete global.__GCN_ASSETS__;
+    } catch (e) {}
+    return manifest && typeof manifest === "object" ? manifest : emptyAssetsManifest();
+  })();
+
+  function sendPortMessage(payload) {
+    if (!diagPort) {
+      return;
+    }
+    try {
+      diagPort.postMessage(payload);
+    } catch (e) {
+      // port が閉じている等は握りつぶす（診断送信の失敗でゲーム進行を止めない）
+    }
+  }
+
+  function reportError(message, stack) {
+    if (reportedErrorCount >= MAX_REPORTED_ERRORS) {
+      return;
+    }
+    reportedErrorCount += 1;
+    var payload = {
+      kind: "gamekit-error",
+      versionId: diagVersionId,
+      message: String(message === null || message === undefined ? "unknown error" : message),
+      stack: stack ? String(stack) : undefined
+    };
+    if (!diagPort) {
+      if (pendingErrors.length < MAX_PENDING_ERRORS) {
+        pendingErrors.push(payload);
+      }
+      return;
+    }
+    sendPortMessage(payload);
+  }
+
+  function tryReportReady() {
+    if (readySent || !diagPort || !readyFlag) {
+      return;
+    }
+    readySent = true;
+    sendPortMessage({ kind: "gamekit-ready", versionId: diagVersionId });
+  }
+
+  // オペークオリジンでは event.origin が "null" になり送信元検証に使えないため、
+  // MessageChannel の port を専有すること自体を認証代わりにする（gamekit.js と同じ考え方）。
+  // compose.ts は正常形 HTML の <head> 直後へ注入し、stopImmediatePropagation で後続の
+  // 生成ロジックへ同じイベント・port を渡さない。ただし malformed な要素順では先行 script を
+  // 原理的に排除できないため、これは defense-in-depth であり権威的制御は Play.tsx 側が担う。
+  global.addEventListener("message", function (event) {
+    var data = event.data;
+    if (!data || data.kind !== "gamekit-init") {
+      return;
+    }
+    event.stopImmediatePropagation();
+    diagVersionId = typeof data.versionId === "string" ? data.versionId : null;
+    if (data.saveData !== undefined && data.saveData !== null && typeof data.saveData === "object") {
+      GCN.saveData = data.saveData;
+    }
+    diagPort = (event.ports && event.ports[0]) || null;
+    if (!diagPort) {
+      return;
+    }
+    for (var i = 0; i < pendingErrors.length; i++) {
+      pendingErrors[i].versionId = diagVersionId;
+      sendPortMessage(pendingErrors[i]);
+    }
+    pendingErrors = [];
+    // init が ready 条件（load + rAF 2 回）より後に届いた場合はここで即送信、
+    // 先に届いていた場合は load ハンドラ側の tryReportReady が後から送る（順序両対応）
+    tryReportReady();
+    if (typeof GCN.onInit === "function") {
+      try {
+        GCN.onInit(GCN.saveData);
+      } catch (e) {
+        reportError(e && e.message ? e.message : String(e), e && e.stack);
+      }
+    }
+  });
+
+  global.addEventListener("error", function (event) {
+    reportError(event.message, event.error && event.error.stack);
+  });
+  global.addEventListener("unhandledrejection", function (event) {
+    var reason = event.reason;
+    reportError(reason && reason.message ? reason.message : String(reason), reason && reason.stack);
+  });
+
+  // ready 自動送信: load イベントの後、requestAnimationFrame を 2 回挟んでからフラグを立てる
+  // （1 回だと最初の描画が済む前に ready を送ってしまい得るため。ゲート A の headless 検証が
+  // 最初のスクリーンショットを撮る前に初期描画が済んでいることを期待するため 2 回待つ）
+  global.addEventListener("load", function () {
+    global.requestAnimationFrame(function () {
+      global.requestAnimationFrame(function () {
+        readyFlag = true;
+        tryReportReady();
+      });
+    });
+  });
+
+  // 送信抑制（ベストエフォートの UX 最適化）: GameKit と違い呼び出し頻度を生成コード側が
+  // 握るため、善意のゲームループ内から毎フレーム呼ばれた場合の MessagePort 連投を減らす。
+  // ただし bridge は未信頼のゲームコードと同一レルムにあり原理的に回避可能なので、これは
+  // セキュリティ境界ではない。D1 POST の権威的な入力・レート・帯域制御は、信頼済み親ページの
+  // Play.tsx が全ランタイム共通で行う（games/runtime/gamekit.js rt-9 の抑制も同じ位置づけ）。
+  // bridge 自身は「先頭即時 + 2 秒クールダウン + 末尾フラッシュ」に抑制する。
+  // クールダウン中の合成則はチャネルごとに異なる: サーバーはスコアを「受信した値のベスト」で
+  // 保持するため、score は最大値を残す（100 → 0 と続いても 100 を失わない）。save は最新値が正。
+  var THROTTLE_MS = 2000;
+  var TEARDOWN_WINDOW_MS = 2000;
+  // teardown 窓内の即時フラッシュ回数上限（チャネル別）。score は本文が数百バイトなので余裕を
+  // 持たせ、save は最大 4KB 強 × keepalive の合計 in-flight 64KiB 制限（Fetch 仕様）を圧迫しない
+  // よう 3 回に絞る（3 × 4KB ≒ 12KB。codex-review 反復 6 P2。現実のゲームの teardown 書き込みは
+  // 1〜2 回であり実質失わない）
+  var TEARDOWN_SCORE_FLUSH_BUDGET = 10;
+  var TEARDOWN_SAVE_FLUSH_BUDGET = 3;
+  // 通常の compose 出力では bridge を生成コードより前へ注入するため、この時点の Date.now /
+  // setTimeout を閉じ込め、後からの偶発的な monkey-patch の影響を減らす（反復 6 P1）。ただし
+  // 不正な HTML 配置等で先行 script が存在し得る以上、未汚染を権威性の根拠にはしない。
+  var nativeDateNow = Date.now;
+  var nativeSetTimeout = global.setTimeout.bind(global);
+  function makeThrottledSender(send, coalesce, teardownBudgetMax) {
+    var cooldown = false;
+    var pending = null;
+    function trigger(value) {
+      cooldown = true;
+      send(value);
+      nativeSetTimeout(function () {
+        cooldown = false;
+        if (pending !== null) {
+          var next = pending;
+          pending = null;
+          trigger(next);
+        }
+      }, THROTTLE_MS);
+    }
+    // teardown 用の即時フラッシュ窓。trusted なライフサイクルイベントを bridge のリスナーが
+    // 観測したときだけ「時間窓 + 回数上限」が付与され、窓内のクールダウン中 submit は即時
+    // フラッシュされる。これにより「ゲーム側の pagehide ハンドラが bridge のフラッシュより後に
+    // GCN.save/score を呼ぶ」順序でも、teardown 中に同一チャネルへ複数回書く正当なゲーム
+    // （pagehide リスナー 2 つ等。codex-review 反復 5 P1）でも最終値を取りこぼさない。
+    // document.visibilityState は Object.defineProperty で偽装できる（反復 4 P1）ため判定に
+    // 使わない — 窓は trusted イベント由来のみで、合成イベント・プロパティ偽装では開かない。
+    // 乱用の上限は「実イベント 1 回あたり teardownBudgetMax 回・TEARDOWN_WINDOW_MS 以内」。
+    // 上限超過後の書き込みは pending に合成されるだけになる（現実のゲームの teardown 書き込みは
+    // 1〜2 回であり実質失わない）
+    var teardownWindowUntil = 0;
+    var teardownFlushBudget = 0;
+    function submit(value) {
+      if (cooldown) {
+        pending = pending === null ? value : coalesce(pending, value);
+        if (teardownFlushBudget > 0 && nativeDateNow() < teardownWindowUntil) {
+          teardownFlushBudget--;
+          submit.flush();
+        }
+        return;
+      }
+      trigger(value);
+    }
+    // ページ破棄時の取りこぼし防止: クールダウン待ちの未送信値を即時送信する
+    // （タイマーはフレーム破棄で消えるため、待っていると親に届かない）
+    submit.flush = function () {
+      if (pending !== null) {
+        var next = pending;
+        pending = null;
+        send(next);
+      }
+    };
+    submit.armTeardownFlush = function () {
+      teardownWindowUntil = nativeDateNow() + TEARDOWN_WINDOW_MS;
+      teardownFlushBudget = teardownBudgetMax;
+    };
+    submit.disarmTeardownFlush = function () {
+      teardownWindowUntil = 0;
+      teardownFlushBudget = 0;
+    };
+    return submit;
+  }
+  var sendScoreThrottled = makeThrottledSender(function (score) {
+    sendPortMessage({ kind: "gamekit-score", versionId: diagVersionId, score: score });
+  }, function (a, b) {
+    return a > b ? a : b;
+  }, TEARDOWN_SCORE_FLUSH_BUDGET);
+  var sendSaveThrottled = makeThrottledSender(function (json) {
+    sendPortMessage({ kind: "gamekit-save", versionId: diagVersionId, data: json });
+  }, function (a, b) {
+    return b;
+  }, TEARDOWN_SAVE_FLUSH_BUDGET);
+  function flushPendingMessages() {
+    sendScoreThrottled.flush();
+    sendSaveThrottled.flush();
+  }
+  function armTeardownFlush() {
+    sendScoreThrottled.armTeardownFlush();
+    sendSaveThrottled.armTeardownFlush();
+  }
+  function disarmTeardownFlush() {
+    sendScoreThrottled.disarmTeardownFlush();
+    sendSaveThrottled.disarmTeardownFlush();
+  }
+  // pagehide は iOS Safari でも発火する。visibilitychange は保険（gamekit.js rt-9 と同じ）。
+  // isTrusted ガード: ゲームコードが dispatchEvent(new Event("pagehide")) で合成イベントを
+  // 連打してもフラッシュ（= スロットリングのバイパス経路）を踏めないようにする。
+  // フラッシュ後に arm するのは、同じイベントディスパッチ内で後から動くゲーム側ハンドラの
+  // GCN.save/score を即時送信するため（時間窓 + 回数上限。makeThrottledSender 参照）。
+  // hidden 判定は偽装可能な visibilityState を見ず「pagehide = 破棄へ向かう」
+  // 「visibilitychange = 表示状態が切り替わった」という trusted イベントの発生自体で扱う。
+  global.addEventListener("pagehide", function (event) {
+    if (event.isTrusted) {
+      flushPendingMessages();
+      armTeardownFlush();
+    }
+  });
+  global.addEventListener("pageshow", function (event) {
+    // bfcache から復帰したら通常のスロットリング動作に戻す（未使用の窓を破棄）
+    if (event.isTrusted) {
+      disarmTeardownFlush();
+    }
+  });
+  global.addEventListener("visibilitychange", function (event) {
+    // hidden への遷移か visible への復帰かを visibilityState で区別しない（偽装可能なため）。
+    // どちら向きでも「未送信分をフラッシュして窓を付与」で統一する — visible 復帰時に短時間の
+    // 即時送信を許すだけで、乱用には trusted イベントの実発生が必要なので有害でない
+    if (event.isTrusted) {
+      flushPendingMessages();
+      armTeardownFlush();
+    }
+  });
+
+  var GCN = {
+    saveData: null,
+    assets: assetsManifest,
+    onInit: undefined,
+    score: function (n) {
+      if (typeof n !== "number" || !isFinite(n)) {
+        reportError("GCN.score: 数値を渡してください");
+        return;
+      }
+      sendScoreThrottled(Math.floor(n));
+    },
+    save: function (json) {
+      if (typeof json !== "string") {
+        reportError("GCN.save: JSON 文字列を渡してください（JSON.stringify 済みのもの）");
+        return;
+      }
+      sendSaveThrottled(json);
+    }
+  };
+
+  global.GCN = GCN;
+})(window);
+</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>けいさんブロック</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; }
+  body {
+    font-family:"Hiragino Maru Gothic ProN","Hiragino Sans","Yu Gothic",sans-serif;
+    background:linear-gradient(180deg,#fff7e6 0%,#ffe9c7 60%,#ffe0b8 100%);
+    display:flex; justify-content:center; align-items:flex-start;
+    min-height:100%;
+    color:#5a4632;
+    user-select:none; -webkit-user-select:none; -webkit-touch-callout:none;
+    touch-action:manipulation;
+    overflow-x:hidden;
+  }
+  #app {
+    width:100%; max-width:620px;
+    padding:14px 10px 28px;
+    display:flex; flex-direction:column; align-items:center; gap:12px;
+  }
+  h1 { font-size:clamp(20px,5.5vw,30px); letter-spacing:2px; text-shadow:0 2px 0 #ffffff; }
+  .hint { font-size:clamp(12px,3.4vw,15px); color:#a08b6b; margin-top:-6px; }
+
+  /* 10/20/30 切り替え */
+  #seg { display:flex; gap:8px; background:#ffffffaa; padding:6px; border-radius:999px; box-shadow:0 2px 6px rgba(180,140,80,.25); }
+  .segbtn {
+    border:none; border-radius:999px; padding:8px 22px;
+    font-size:clamp(15px,4.2vw,19px); font-weight:bold; font-family:inherit;
+    background:transparent; color:#a08b6b; cursor:pointer;
+  }
+  .segbtn.active { background:linear-gradient(180deg,#ffb85c,#ff9426); color:#fff; box-shadow:0 2px 0 #d97606; }
+
+  /* たしざん・ひきざん 式エリア */
+  #eqs {
+    display:flex; flex-direction:column; gap:8px;
+    background:#ffffffb0; padding:12px 16px; border-radius:18px;
+    box-shadow:0 2px 8px rgba(180,140,80,.22);
+  }
+  .eqline { display:flex; align-items:center; gap:8px; font-size:clamp(17px,4.8vw,25px); font-weight:bold; }
+  .tag {
+    font-size:clamp(11px,3vw,14px); font-weight:bold;
+    background:#efe3c8; color:#8a7a5f;
+    padding:4px 10px; border-radius:999px; letter-spacing:1px;
+    min-width:4.2em; text-align:center;
+  }
+  .tag.sub { background:#dbe9f7; color:#4a6f9b; }
+  .pill { min-width:1.9em; text-align:center; padding:2px 12px; border-radius:999px; color:#fff; box-shadow:0 2px 0 rgba(0,0,0,.15); }
+  .blue-pill   { background:#2f9bff; }
+  .orange-pill { background:#ff9426; }
+  .total-pill  { background:#8a7a5f; }
+  .op { color:#b39a74; }
+  .bump { animation:bump .2s ease; }
+  @keyframes bump { 0%{transform:scale(1)} 50%{transform:scale(1.25)} 100%{transform:scale(1)} }
+
+  /* ブロック盤面 */
+  #board {
+    display:grid; grid-template-columns:repeat(10,1fr); gap:5px;
+    width:100%; background:#ffffffb0; padding:10px; border-radius:18px;
+    box-shadow:inset 0 2px 8px rgba(180,140,80,.25), 0 4px 10px rgba(180,140,80,.2);
+  }
+  .block {
+    aspect-ratio:1; border-radius:20%;
+    background:linear-gradient(180deg,#ffc06e 0%,#ff9a2e 70%,#f58a12 100%);
+    box-shadow:0 3px 0 #d97606, 0 4px 6px rgba(0,0,0,.18);
+    cursor:pointer;
+  }
+  .block.blue {
+    background:linear-gradient(180deg,#7cc7ff 0%,#3ba3ff 70%,#1e90f0 100%);
+    box-shadow:0 3px 0 #1668c4, 0 4px 6px rgba(0,0,0,.18);
+  }
+  .block:active { transform:translateY(2px) scale(.94); box-shadow:0 1px 0 rgba(0,0,0,.2); }
+  .block.pop { animation:pop .18s ease; }
+  @keyframes pop { 0%{transform:scale(.6)} 60%{transform:scale(1.15)} 100%{transform:scale(1)} }
+
+  .caption { font-size:clamp(12px,3.4vw,15px); color:#a08b6b; font-weight:bold; }
+
+  /* 1〜10 ボタン */
+  #nums { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; width:100%; }
+  .num {
+    border:none; border-radius:14px; padding:10px 0;
+    font-size:clamp(17px,4.8vw,22px); font-weight:bold; font-family:inherit;
+    background:#ffffff; color:#5a4632; cursor:pointer;
+    box-shadow:0 3px 0 #d9c9a8, 0 4px 6px rgba(0,0,0,.1);
+  }
+  .num:active { transform:translateY(2px); box-shadow:0 1px 0 #d9c9a8; background:#eaf5ff; color:#1e90f0; }
+
+  /* リセット */
+  #reset {
+    border:none; border-radius:16px; padding:12px 0; width:100%;
+    font-size:clamp(16px,4.5vw,20px); font-weight:bold; font-family:inherit;
+    background:linear-gradient(180deg,#9fd67c,#6fbf4a); color:#fff; cursor:pointer;
+    box-shadow:0 4px 0 #4e9430, 0 5px 8px rgba(0,0,0,.15);
+  }
+  #reset:active { transform:translateY(3px); box-shadow:0 1px 0 #4e9430; }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>🧮 けいさんブロック</h1>
+  <div class="hint">ブロックを タップすると いろが かわるよ！</div>
+
+  <div id="seg">
+    <button class="segbtn active" data-n="10">10</button>
+    <button class="segbtn" data-n="20">20</button>
+    <button class="segbtn" data-n="30">30</button>
+  </div>
+
+  <div id="eqs">
+    <div class="eqline">
+      <span class="tag">たしざん</span>
+      <span class="pill blue-pill" id="addA">0</span>
+      <span class="op">＋</span>
+      <span class="pill orange-pill" id="addB">10</span>
+      <span class="op">＝</span>
+      <span class="pill total-pill" id="addC">10</span>
+    </div>
+    <div class="eqline">
+      <span class="tag sub">ひきざん</span>
+      <span class="pill total-pill" id="subA">10</span>
+      <span class="op">−</span>
+      <span class="pill blue-pill" id="subB">0</span>
+      <span class="op">＝</span>
+      <span class="pill orange-pill" id="subC">10</span>
+    </div>
+  </div>
+
+  <div id="board"></div>
+
+  <div class="caption">▼ おした かずだけ ひだりから あおに なるよ</div>
+  <div id="nums"></div>
+
+  <button id="reset">🔄 リセット</button>
+</div>
+
+<script>
+(function () {
+  var total = 10;
+  var blocks = []; // true = 青, false = オレンジ
+
+  var board    = document.getElementById('board');
+  var numsEl   = document.getElementById('nums');
+  var addA     = document.getElementById('addA');
+  var addB     = document.getElementById('addB');
+  var addC     = document.getElementById('addC');
+  var subA     = document.getElementById('subA');
+  var subB     = document.getElementById('subB');
+  var subC     = document.getElementById('subC');
+  var resetBtn = document.getElementById('reset');
+  var segBtns  = document.querySelectorAll('.segbtn');
+
+  /* ---------- 音（最初のタップで解禁） ---------- */
+  var actx = null;
+  function ensureAudio() {
+    if (!actx) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') { actx.resume(); }
+  }
+  function blip(freq, dur) {
+    ensureAudio();
+    if (!actx) return;
+    dur = dur || 0.14;
+    var t = actx.currentTime;
+    var o = actx.createOscillator();
+    var g = actx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.22, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(t); o.stop(t + dur + 0.03);
+  }
+
+  /* ---------- 表示更新 ---------- */
+  function bumpEl(el) {
+    el.classList.remove('bump'); void el.offsetWidth; el.classList.add('bump');
+  }
+  function setPill(el, v) {
+    var s = String(v);
+    if (el.textContent !== s) { el.textContent = s; bumpEl(el); }
+  }
+  function updateEq() {
+    var b = 0, i;
+    for (i = 0; i < blocks.length; i++) { if (blocks[i]) b++; }
+    // たしざん: あお ＋ オレンジ ＝ ぜんぶ
+    setPill(addA, b);
+    setPill(addB, total - b);
+    setPill(addC, total);
+    // ひきざん: ぜんぶ − あお ＝ オレンジ
+    setPill(subA, total);
+    setPill(subB, b);
+    setPill(subC, total - b);
+  }
+
+  function popEl(el) {
+    el.classList.remove('pop'); void el.offsetWidth; el.classList.add('pop');
+  }
+
+  /* ---------- ブロック操作 ---------- */
+  function toggle(i, el) {
+    blocks[i] = !blocks[i];
+    el.classList.toggle('blue', blocks[i]);
+    popEl(el);
+    blip(blocks[i] ? 660 : 392);
+    updateEq();
+  }
+
+  function buildBoard() {
+    board.innerHTML = '';
+    blocks = [];
+    for (var i = 0; i < total; i++) {
+      (function (i) {
+        blocks.push(false);
+        var d = document.createElement('div');
+        d.className = 'block';
+        d.addEventListener('click', function () { toggle(i, d); });
+        board.appendChild(d);
+        setTimeout(function () { popEl(d); }, i * 18); // 出現アニメ
+      })(i);
+    }
+    updateEq();
+  }
+
+  /* 左詰めで n 個を青にする（1〜10ボタン / リセット） */
+  function setBlue(n) {
+    for (var i = 0; i < total; i++) {
+      (function (i) {
+        setTimeout(function () {
+          var want = i < n;
+          var el = board.children[i];
+          if (!el) return;
+          if (blocks[i] !== want) {
+            blocks[i] = want;
+            el.classList.toggle('blue', want);
+            popEl(el);
+            blip(420 + i * 22);
+          }
+          updateEq();
+        }, i * 28);
+      })(i);
+    }
+  }
+
+  /* ---------- 1〜10 ボタン ---------- */
+  for (var n = 1; n <= 10; n++) {
+    (function (n) {
+      var b = document.createElement('button');
+      b.className = 'num';
+      b.textContent = n;
+      b.addEventListener('click', function () { setBlue(n); });
+      numsEl.appendChild(b);
+    })(n);
+  }
+
+  /* ---------- リセット ---------- */
+  resetBtn.addEventListener('click', function () {
+    blip(330, 0.2);
+    setBlue(0);
+  });
+
+  /* ---------- 10/20/30 切り替え ---------- */
+  for (var k = 0; k < segBtns.length; k++) {
+    segBtns[k].addEventListener('click', function (e) {
+      var btn = e.currentTarget;
+      var val = parseInt(btn.getAttribute('data-n'), 10);
+      if (val === total) return;
+      total = val;
+      for (var j = 0; j < segBtns.length; j++) { segBtns[j].classList.remove('active'); }
+      btn.classList.add('active');
+      blip(520, 0.18);
+      buildBoard();
+    });
+  }
+
+  buildBoard();
+})();
+</script>
+</body>
+</html>
